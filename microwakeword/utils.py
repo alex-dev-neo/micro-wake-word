@@ -373,10 +373,11 @@ def convert_model_saved(model, config, folder, mode):
     # quantization, we create an export archive directly instead.
     export_archive = tf.keras.export.ExportArchive()
     export_archive.track(converted_model)
+    in_shape = tuple(converted_model.input.shape[1:])
     export_archive.add_endpoint(
         name="serve",
         fn=converted_model.call,
-        input_signature=[tf.TensorSpec(shape=converted_model.input.shape, dtype=tf.float32)],
+        input_signature=[tf.TensorSpec(shape=(1, *in_shape), dtype=tf.float32, name="inputs")],
     )
     export_archive.write_out(path_model)
 
