@@ -322,6 +322,7 @@ def convert_saved_model_to_tflite(
 
             for i in range(0, spectrogram.shape[0] - stride, stride):
                 sample = spectrogram[i : i + stride, :].astype(np.float32)
+                sample = np.expand_dims(sample, axis=0)
                 yield [sample]
 
     converter = tf.lite.TFLiteConverter.from_saved_model(path_to_model)
