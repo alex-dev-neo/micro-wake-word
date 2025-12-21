@@ -322,7 +322,6 @@ def convert_saved_model_to_tflite(
 
             for i in range(0, spectrogram.shape[0] - stride, stride):
                 sample = spectrogram[i : i + stride, :].astype(np.float32)
-                sample = np.expand_dims(sample, axis=0)
                 yield [sample]
 
     converter = tf.lite.TFLiteConverter.from_saved_model(path_to_model)
@@ -373,11 +372,10 @@ def convert_model_saved(model, config, folder, mode):
     # quantization, we create an export archive directly instead.
     export_archive = tf.keras.export.ExportArchive()
     export_archive.track(converted_model)
-    in_shape = tuple(converted_model.input.shape[1:])
     export_archive.add_endpoint(
         name="serve",
         fn=converted_model.call,
-        input_signature=[tf.TensorSpec(shape=(1, *in_shape), dtype=tf.float32, name="inputs")],
+        input_signature=[tf.TensorSpec(shape=converted_model.input.shape, dtype=tf.float32)],
     )
     export_archive.write_out(path_model)
 
