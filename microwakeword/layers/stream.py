@@ -557,7 +557,8 @@ class Stream(tf.keras.layers.Layer):
                 ]  # pylint: disable=invalid-unary-operand-type
             assign_states = self.states.assign(new_state)
 
-            with tf.control_dependencies([assign_states]):
+            deps = [] if assign_states is None else [assign_states]
+            with tf.control_dependencies(deps):
                 if self.transposed_conv_crop_output:
                     return tf.keras.layers.Identity()(outputs[:, 0 : self.output_time_dim, :])
                 else:
@@ -576,7 +577,8 @@ class Stream(tf.keras.layers.Layer):
 
                 assign_states = self.states.assign(memory)
 
-                with tf.control_dependencies([assign_states]):
+                deps = [] if assign_states is None else [assign_states]
+                with tf.control_dependencies(deps):
                     return self.cell(memory)
             else:
                 # add new row [batch_size, memory_size, feature_dim, channel]
@@ -589,7 +591,8 @@ class Stream(tf.keras.layers.Layer):
 
                     assign_states = self.states.assign(state_update)
 
-                    with tf.control_dependencies([assign_states]):
+                    deps = [] if assign_states is None else [assign_states]
+                    with tf.control_dependencies(deps):
                         return self.cell(memory)
                 else:
                     return self.cell(inputs)
@@ -693,3 +696,4 @@ class Stream(tf.keras.layers.Layer):
                 inputs = tf.pad(inputs, pad, "constant")
 
             return self.cell(inputs)
+
