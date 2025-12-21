@@ -16,6 +16,7 @@ setuptools.setup(
         "pyyaml",
         "tensorflow>=2.16",
         "webrtcvad-wheels",
+        "ai-edge-litert",
     ],
     author="Kevin Ahrendt",
     author_email="kahrendt@gmail.com",

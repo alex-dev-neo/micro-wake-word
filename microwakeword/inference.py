@@ -18,7 +18,7 @@
 
 # imports
 import numpy as np
-import tensorflow as tf
+from ai_edge_litert.interpreter import Interpreter
 from microwakeword.audio.audio_utils import generate_features_for_clip
 
 
@@ -33,7 +33,7 @@ class Model:
 
     def __init__(self, tflite_model_path: str, stride: int | None = None):
         # Load tflite model
-        interpreter = tf.lite.Interpreter(
+        interpreter = Interpreter(
             model_path=tflite_model_path,
         )
         interpreter.allocate_tensors()
