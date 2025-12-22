@@ -18,7 +18,14 @@
 
 # imports
 import numpy as np
-from ai_edge_litert.interpreter import Interpreter
+
+# Prefer ai_edge_litert if available, but fall back to TF's TFLite interpreter on macOS
+try:
+    from ai_edge_litert.interpreter import Interpreter  # type: ignore
+except Exception:
+    import tensorflow as tf
+    Interpreter = tf.lite.Interpreter  # type: ignore
+
 from microwakeword.audio.audio_utils import generate_features_for_clip
 
 
