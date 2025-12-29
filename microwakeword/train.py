@@ -16,11 +16,16 @@
 
 import os
 import contextlib
+import multiprocessing
+import queue
+import time
 
 from absl import logging
 
 import numpy as np
 import tensorflow as tf
+# Import worker function from data.py
+import microwakeword.data as data_module 
 
 from tensorflow.python.util import tf_decorator
 
@@ -45,23 +50,24 @@ def swap_attribute(obj, attr, temp_value):
 
 
 def validate_nonstreaming(config, data_processor, model, test_set):
+    # Get all validation data
     testing_fingerprints, testing_ground_truth, _ = data_processor.get_data(
         test_set,
         batch_size=config["batch_size"],
         features_length=config["spectrogram_length"],
         truncation_strategy="truncate_start",
     )
+    
     testing_ground_truth = testing_ground_truth.reshape(-1, 1)
 
     model.reset_metrics()
 
-    result = model.evaluate(
-        testing_fingerprints,
-        testing_ground_truth,
-        batch_size=1024,
-        return_dict=True,
-        verbose=0,
-    )
+    # FIX OOM: Streaming validation
+    test_ds = tf.data.Dataset.from_tensor_slices(
+        (testing_fingerprints, testing_ground_truth)
+    ).batch(128).prefetch(tf.data.AUTOTUNE)
+
+    result = model.evaluate(test_ds, return_dict=True, verbose=0)
 
     metrics = {}
     metrics["accuracy"] = result["accuracy"]
@@ -75,11 +81,7 @@ def validate_nonstreaming(config, data_processor, model, test_set):
     metrics["ambient_false_positives_per_hour"] = 0
     metrics["average_viable_recall"] = 0
 
-    # ✅ already good
     test_set_fp = _to_numpy(result["fp"])
-    test_set_fn = _to_numpy(result["fn"])
-    test_set_tp = _to_numpy(result["tp"])
-    test_set_tn = _to_numpy(result["tn"])
 
     if data_processor.get_mode_size("validation_ambient") > 0:
         (
@@ -94,26 +96,21 @@ def validate_nonstreaming(config, data_processor, model, test_set):
         )
         ambient_testing_ground_truth = ambient_testing_ground_truth.reshape(-1, 1)
 
-        # XXX: tf no longer provides a way to evaluate a model without updating metrics
+        ambient_ds = tf.data.Dataset.from_tensor_slices(
+            (ambient_testing_fingerprints, ambient_testing_ground_truth)
+        ).batch(128).prefetch(tf.data.AUTOTUNE)
+
         with swap_attribute(model, "reset_metrics", lambda: None):
-            ambient_predictions = model.evaluate(
-                ambient_testing_fingerprints,
-                ambient_testing_ground_truth,
-                batch_size=1024,
-                return_dict=True,
-                verbose=0,
-            )
+            ambient_predictions = model.evaluate(ambient_ds, return_dict=True, verbose=0)
 
         duration_of_ambient_set = (
             data_processor.get_mode_duration("validation_ambient") / 3600.0
         )
 
-        # 🔴 THESE were still using .numpy() directly
         all_true_positives = _to_numpy(ambient_predictions["tp"])
         ambient_fp_raw = _to_numpy(ambient_predictions["fp"])
         all_false_negatives = _to_numpy(ambient_predictions["fn"])
 
-        # subtract test-set fp we computed above
         ambient_false_positives = ambient_fp_raw - test_set_fp
 
         metrics["auc"] = ambient_predictions["auc"]
@@ -132,9 +129,6 @@ def validate_nonstreaming(config, data_processor, model, test_set):
                 break
 
         if faph_at_cutoffs[0] > 2:
-            # Use linear interpolation to estimate recall at 2 faph
-
-            # Increase index until we find a faph less than 2
             index_of_first_viable = 1
             while faph_at_cutoffs[index_of_first_viable] > 2:
                 index_of_first_viable += 1
@@ -146,7 +140,6 @@ def validate_nonstreaming(config, data_processor, model, test_set):
 
             recall_at_2faph = (y0 * (x1 - 2.0) + y1 * (2.0 - x0)) / (x1 - x0)
         else:
-            # Lowest faph is already under 2, assume the recall is constant before this
             index_of_first_viable = 0
             recall_at_2faph = recall_at_cutoffs[0]
 
@@ -172,48 +165,52 @@ def validate_nonstreaming(config, data_processor, model, test_set):
 
 
 def train(model, config, data_processor):
-    # Assign default training settings if not set in the configuration yaml
-    if not (training_steps_list := config.get("training_steps")):
-        training_steps_list = [20000]
-    if not (learning_rates_list := config.get("learning_rates")):
-        learning_rates_list = [0.001]
-    if not (mix_up_prob_list := config.get("mix_up_augmentation_prob")):
-        mix_up_prob_list = [0.0]
-    if not (freq_mix_prob_list := config.get("freq_mix_augmentation_prob")):
-        freq_mix_prob_list = [0.0]
-    if not (time_mask_max_size_list := config.get("time_mask_max_size")):
-        time_mask_max_size_list = [5]
-    if not (time_mask_count_list := config.get("time_mask_count")):
-        time_mask_count_list = [2]
-    if not (freq_mask_max_size_list := config.get("freq_mask_max_size")):
-        freq_mask_max_size_list = [5]
-    if not (freq_mask_count_list := config.get("freq_mask_count")):
-        freq_mask_count_list = [2]
-    if not (positive_class_weight_list := config.get("positive_class_weight")):
-        positive_class_weight_list = [1.0]
-    if not (negative_class_weight_list := config.get("negative_class_weight")):
-        negative_class_weight_list = [1.0]
-
-    # Ensure all training setting lists are as long as the training step iterations
-    def pad_list_with_last_entry(list_to_pad, desired_length):
-        while len(list_to_pad) < desired_length:
-            last_entry = list_to_pad[-1]
-            list_to_pad.append(last_entry)
-
+    # --- CONFIG PREPARATION ---
+    if not (training_steps_list := config.get("training_steps")): training_steps_list = [20000]
+    if not (learning_rates_list := config.get("learning_rates")): learning_rates_list = [0.001]
+    
+    aug_keys = [
+        "mix_up_augmentation_prob", "freq_mix_augmentation_prob", 
+        "time_mask_max_size", "time_mask_count", 
+        "freq_mask_max_size", "freq_mask_count",
+        "positive_class_weight", "negative_class_weight"
+    ]
+    
+    augmentation_configs = {}
     training_step_iterations = len(training_steps_list)
-    pad_list_with_last_entry(learning_rates_list, training_step_iterations)
-    pad_list_with_last_entry(mix_up_prob_list, training_step_iterations)
-    pad_list_with_last_entry(freq_mix_prob_list, training_step_iterations)
-    pad_list_with_last_entry(time_mask_max_size_list, training_step_iterations)
-    pad_list_with_last_entry(time_mask_count_list, training_step_iterations)
-    pad_list_with_last_entry(freq_mask_max_size_list, training_step_iterations)
-    pad_list_with_last_entry(freq_mask_count_list, training_step_iterations)
-    pad_list_with_last_entry(positive_class_weight_list, training_step_iterations)
-    pad_list_with_last_entry(negative_class_weight_list, training_step_iterations)
+    
+    def pad_list(lst, length, default=0):
+        if not lst: lst = [default]
+        while len(lst) < length: lst.append(lst[-1])
+        return lst
 
+    key_map = {
+        "mix_up_augmentation_prob": "mix_up_prob",
+        "freq_mix_augmentation_prob": "freq_mix_prob",
+        "time_mask_max_size": "time_mask_max_size",
+        "time_mask_count": "time_mask_count",
+        "freq_mask_max_size": "freq_mask_max_size",
+        "freq_mask_count": "freq_mask_count",
+        "positive_class_weight": "positive_class_weight",
+        "negative_class_weight": "negative_class_weight"
+    }
+
+    pad_list(learning_rates_list, training_step_iterations)
+    
+    for cfg_key in aug_keys:
+        val = config.get(cfg_key)
+        if not val:
+            if "weight" in cfg_key: val = [1.0]
+            elif "prob" in cfg_key: val = [0.0]
+            elif "count" in cfg_key: val = [2]
+            elif "size" in cfg_key: val = [5]
+            else: val = [0]
+        pad_list(val, training_step_iterations)
+        augmentation_configs[key_map[cfg_key]] = val
+
+    # --- MODEL SETUP ---
     loss = tf.keras.losses.BinaryCrossentropy(from_logits=False)
     optimizer = tf.keras.optimizers.Adam()
-
     cutoffs = np.linspace(0.0, 1.0, 101).tolist()
 
     metrics = [
@@ -229,129 +226,100 @@ def train(model, config, data_processor):
     ]
 
     model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
-
-    # We un-decorate the `tf.function`, it's very slow to manually run training batches
     model.make_train_function()
     _, model.train_function = tf_decorator.unwrap(model.train_function)
 
-    # Configure checkpointer and restore if available
     checkpoint_directory = os.path.join(config["train_dir"], "restore/")
     checkpoint_prefix = os.path.join(checkpoint_directory, "ckpt")
     checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
     checkpoint.restore(tf.train.latest_checkpoint(checkpoint_directory))
 
-    # Configure TensorBoard summaries
-    train_writer = tf.summary.create_file_writer(
-        os.path.join(config["summaries_dir"], "train")
-    )
-    validation_writer = tf.summary.create_file_writer(
-        os.path.join(config["summaries_dir"], "validation")
-    )
+    train_writer = tf.summary.create_file_writer(os.path.join(config["summaries_dir"], "train"))
+    validation_writer = tf.summary.create_file_writer(os.path.join(config["summaries_dir"], "validation"))
 
     training_steps_max = np.sum(training_steps_list)
-
     best_minimization_quantity = 10000
     best_maximization_quantity = 0.0
     best_no_faph_cutoff = 1.0
 
-    for training_step in range(1, training_steps_max + 1):
-        training_steps_sum = 0
-        for i in range(len(training_steps_list)):
-            training_steps_sum += training_steps_list[i]
-            if training_step <= training_steps_sum:
-                learning_rate = learning_rates_list[i]
-                mix_up_prob = mix_up_prob_list[i]
-                freq_mix_prob = freq_mix_prob_list[i]
-                time_mask_max_size = time_mask_max_size_list[i]
-                time_mask_count = time_mask_count_list[i]
-                freq_mask_max_size = freq_mask_max_size_list[i]
-                freq_mask_count = freq_mask_count_list[i]
-                positive_class_weight = positive_class_weight_list[i]
-                negative_class_weight = negative_class_weight_list[i]
-                break
+    # --- START MULTIPROCESSING WORKERS ---
+    print("🚀 Starting MULTIPROCESSING data loaders (Using 6 CPU cores)...")
+    
+    # Use 'spawn' to avoid contaminating workers with TensorFlow GPU context
+    ctx = multiprocessing.get_context('spawn')
+    data_queue = ctx.Queue(maxsize=30)
+    stop_event = ctx.Event()
+    processes = []
 
-        model.optimizer.learning_rate.assign(learning_rate)
-
-        augmentation_policy = {
-            "mix_up_prob": mix_up_prob,
-            "freq_mix_prob": freq_mix_prob,
-            "time_mask_max_size": time_mask_max_size,
-            "time_mask_count": time_mask_count,
-            "freq_mask_max_size": freq_mask_max_size,
-            "freq_mask_count": freq_mask_count,
-        }
-
-        (
-            train_fingerprints,
-            train_ground_truth,
-            train_sample_weights,
-        ) = data_processor.get_data(
-            "training",
-            batch_size=config["batch_size"],
-            features_length=config["spectrogram_length"],
-            truncation_strategy="default",
-            augmentation_policy=augmentation_policy,
+    # Calculate steps logic once to pass to worker? No, passing lists is fine.
+    # Launch 6 workers to saturate CPU
+    for _ in range(6):
+        p = ctx.Process(
+            target=data_module.data_loader_process, 
+            args=(config, training_steps_list, learning_rates_list, augmentation_configs, data_queue, stop_event)
         )
+        p.start()
+        processes.append(p)
 
-        train_ground_truth = train_ground_truth.reshape(-1, 1)
+    # Calculate step map for MAIN LOOP usage (Learning Rate)
+    settings_map = []
+    current_sum = 0
+    for i in range(len(training_steps_list)):
+        current_sum += training_steps_list[i]
+        settings_map.append((current_sum, i))
 
-        class_weights = {0: negative_class_weight, 1: positive_class_weight}
-        combined_weights = train_sample_weights * np.vectorize(class_weights.get)(
-            train_ground_truth
-        )
+    try:
+        idx = 0
+        for training_step in range(1, training_steps_max + 1):
+            
+            # Get data from queue (produced by other cores)
+            batch_data = data_queue.get()
+            
+            # Determine Learning Rate for this step
+            if training_step > settings_map[idx][0]:
+                if idx < len(settings_map) - 1: idx += 1
+            config_idx = settings_map[idx][1]
+            learning_rate = learning_rates_list[config_idx]
+            
+            model.optimizer.learning_rate.assign(learning_rate)
 
-        result = model.train_on_batch(
-            train_fingerprints,
-            train_ground_truth,
-            sample_weight=combined_weights,
-        )
+            result = model.train_on_batch(
+                batch_data["x"],
+                batch_data["y"],
+                sample_weight=batch_data["w"],
+            )
 
-        # Print the running statistics in the current validation epoch
-        print(
-            "Validation Batch #{:d}: Accuracy = {:.3f}; Recall = {:.3f}; Precision = {:.3f}; Loss = {:.4f}; Mini-Batch #{:d}".format(
-                (training_step // config["eval_step_interval"] + 1),
-                result[1],
-                result[2],
-                result[3],
-                result[9],
-                (training_step % config["eval_step_interval"]),
-            ),
-            end="\r",
-        )
-
-        is_last_step = training_step == training_steps_max
-        if (training_step % config["eval_step_interval"]) == 0 or is_last_step:
-            logging.info(
-                "Step #%d: rate %f, accuracy %.2f%%, recall %.2f%%, precision %.2f%%, cross entropy %f",
-                *(
-                    training_step,
-                    learning_rate,
-                    result[1] * 100,
-                    result[2] * 100,
-                    result[3] * 100,
-                    result[9],
+            print(
+                "Validation Batch #{:d}: Accuracy = {:.3f}; Recall = {:.3f}; Precision = {:.3f}; Loss = {:.4f}; Mini-Batch #{:d}".format(
+                    (training_step // config["eval_step_interval"] + 1),
+                    result[1], result[2], result[3], result[9],
+                    (training_step % config["eval_step_interval"]),
                 ),
+                end="\r",
             )
 
-            with train_writer.as_default():
-                tf.summary.scalar("loss", result[9], step=training_step)
-                tf.summary.scalar("accuracy", result[1], step=training_step)
-                tf.summary.scalar("recall", result[2], step=training_step)
-                tf.summary.scalar("precision", result[3], step=training_step)
-                tf.summary.scalar("auc", result[8], step=training_step)
-                train_writer.flush()
+            is_last_step = training_step == training_steps_max
+            if (training_step % config["eval_step_interval"]) == 0 or is_last_step:
+                logging.info(
+                    "Step #%d: rate %f, accuracy %.2f%%, recall %.2f%%, precision %.2f%%, cross entropy %f",
+                    training_step, learning_rate, result[1] * 100, result[2] * 100, result[3] * 100, result[9],
+                )
 
-            model.save_weights(
-                os.path.join(config["train_dir"], "last_weights.weights.h5")
-            )
+                with train_writer.as_default():
+                    tf.summary.scalar("loss", result[9], step=training_step)
+                    tf.summary.scalar("accuracy", result[1], step=training_step)
+                    tf.summary.scalar("recall", result[2], step=training_step)
+                    tf.summary.scalar("precision", result[3], step=training_step)
+                    tf.summary.scalar("auc", result[8], step=training_step)
+                    train_writer.flush()
 
-            nonstreaming_metrics = validate_nonstreaming(
-                config, data_processor, model, "validation"
-            )
-            model.reset_metrics()  # reset metrics for next validation epoch of training
-            logging.info(
-                "Step %d (nonstreaming): Validation: recall at no faph = %.3f with cutoff %.2f, accuracy = %.2f%%, recall = %.2f%%, precision = %.2f%%, ambient false positives = %d, estimated false positives per hour = %.5f, loss = %.5f, auc = %.5f, average viable recall = %.9f",
-                *(
+                model.save_weights(os.path.join(config["train_dir"], "last_weights.weights.h5"))
+
+                nonstreaming_metrics = validate_nonstreaming(config, data_processor, model, "validation")
+                model.reset_metrics()
+                
+                logging.info(
+                    "Step %d (nonstreaming): Validation: recall at no faph = %.3f with cutoff %.2f, accuracy = %.2f%%, recall = %.2f%%, precision = %.2f%%, ambient false positives = %d, estimated false positives per hour = %.5f, loss = %.5f, auc = %.5f, average viable recall = %.9f",
                     training_step,
                     nonstreaming_metrics["recall_at_no_faph"] * 100,
                     nonstreaming_metrics["cutoff_for_no_faph"],
@@ -363,108 +331,52 @@ def train(model, config, data_processor):
                     nonstreaming_metrics["loss"],
                     nonstreaming_metrics["auc"],
                     nonstreaming_metrics["average_viable_recall"],
-                ),
-            )
+                )
 
-            with validation_writer.as_default():
-                tf.summary.scalar(
-                    "loss", nonstreaming_metrics["loss"], step=training_step
-                )
-                tf.summary.scalar(
-                    "accuracy", nonstreaming_metrics["accuracy"], step=training_step
-                )
-                tf.summary.scalar(
-                    "recall", nonstreaming_metrics["recall"], step=training_step
-                )
-                tf.summary.scalar(
-                    "precision", nonstreaming_metrics["precision"], step=training_step
-                )
-                tf.summary.scalar(
-                    "recall_at_no_faph",
-                    nonstreaming_metrics["recall_at_no_faph"],
-                    step=training_step,
-                )
-                tf.summary.scalar(
-                    "auc",
-                    nonstreaming_metrics["auc"],
-                    step=training_step,
-                )
-                tf.summary.scalar(
-                    "average_viable_recall",
-                    nonstreaming_metrics["average_viable_recall"],
-                    step=training_step,
-                )
-                validation_writer.flush()
+                with validation_writer.as_default():
+                    tf.summary.scalar("loss", nonstreaming_metrics["loss"], step=training_step)
+                    tf.summary.scalar("accuracy", nonstreaming_metrics["accuracy"], step=training_step)
+                    tf.summary.scalar("recall", nonstreaming_metrics["recall"], step=training_step)
+                    tf.summary.scalar("precision", nonstreaming_metrics["precision"], step=training_step)
+                    tf.summary.scalar("recall_at_no_faph", nonstreaming_metrics["recall_at_no_faph"], step=training_step)
+                    tf.summary.scalar("auc", nonstreaming_metrics["auc"], step=training_step)
+                    tf.summary.scalar("average_viable_recall", nonstreaming_metrics["average_viable_recall"], step=training_step)
+                    validation_writer.flush()
 
-            os.makedirs(os.path.join(config["train_dir"], "train"), exist_ok=True)
+                os.makedirs(os.path.join(config["train_dir"], "train"), exist_ok=True)
+                model.save_weights(os.path.join(config["train_dir"], "train", f"{int(best_minimization_quantity * 10000)}_weights_{training_step}.weights.h5"))
 
-            model.save_weights(
-                os.path.join(
-                    config["train_dir"],
-                    "train",
-                    f"{int(best_minimization_quantity * 10000)}_weights_{training_step}.weights.h5",
+                current_minimization_quantity = 0.0
+                if config["minimization_metric"] is not None:
+                    current_minimization_quantity = nonstreaming_metrics[config["minimization_metric"]]
+                current_maximization_quantity = nonstreaming_metrics[config["maximization_metric"]]
+                current_no_faph_cutoff = nonstreaming_metrics["cutoff_for_no_faph"]
+
+                improved = False
+                if current_minimization_quantity <= config["target_minimization"]:
+                    if current_maximization_quantity > best_maximization_quantity or best_minimization_quantity > config["target_minimization"]:
+                        improved = True
+                elif current_minimization_quantity < best_minimization_quantity:
+                    improved = True
+                elif current_minimization_quantity == best_minimization_quantity and current_maximization_quantity > best_maximization_quantity:
+                    improved = True
+
+                if improved:
+                    best_minimization_quantity = current_minimization_quantity
+                    best_maximization_quantity = current_maximization_quantity
+                    best_no_faph_cutoff = current_no_faph_cutoff
+                    model.save_weights(os.path.join(config["train_dir"], "best_weights.weights.h5"))
+                    checkpoint.save(file_prefix=checkpoint_prefix)
+
+                logging.info(
+                    "So far the best minimization quantity is %.3f with best maximization quantity of %.5f%%; no faph cutoff is %.2f",
+                    best_minimization_quantity, (best_maximization_quantity * 100), best_no_faph_cutoff,
                 )
-            )
 
-            current_minimization_quantity = 0.0
-            if config["minimization_metric"] is not None:
-                current_minimization_quantity = nonstreaming_metrics[
-                    config["minimization_metric"]
-                ]
-            current_maximization_quantity = nonstreaming_metrics[
-                config["maximization_metric"]
-            ]
-            current_no_faph_cutoff = nonstreaming_metrics["cutoff_for_no_faph"]
+    finally:
+        stop_event.set()
+        for p in processes:
+            p.terminate()
 
-            # Save model weights if this is a new best model
-            if (
-                (
-                    (
-                        current_minimization_quantity <= config["target_minimization"]
-                    )  # achieved target false positive rate
-                    and (
-                        (
-                            current_maximization_quantity > best_maximization_quantity
-                        )  # either accuracy improved
-                        or (
-                            best_minimization_quantity > config["target_minimization"]
-                        )  # or this is the first time we met the target
-                    )
-                )
-                or (
-                    (
-                        current_minimization_quantity > config["target_minimization"]
-                    )  # we haven't achieved our target
-                    and (
-                        current_minimization_quantity < best_minimization_quantity
-                    )  # but we have decreased since the previous best
-                )
-                or (
-                    (
-                        current_minimization_quantity == best_minimization_quantity
-                    )  # we tied a previous best
-                    and (
-                        current_maximization_quantity > best_maximization_quantity
-                    )  # and we increased our accuracy
-                )
-            ):
-                best_minimization_quantity = current_minimization_quantity
-                best_maximization_quantity = current_maximization_quantity
-                best_no_faph_cutoff = current_no_faph_cutoff
-
-                # overwrite the best model weights
-                model.save_weights(
-                    os.path.join(config["train_dir"], "best_weights.weights.h5")
-                )
-                checkpoint.save(file_prefix=checkpoint_prefix)
-
-            logging.info(
-                "So far the best minimization quantity is %.3f with best maximization quantity of %.5f%%; no faph cutoff is %.2f",
-                best_minimization_quantity,
-                (best_maximization_quantity * 100),
-                best_no_faph_cutoff,
-            )
-
-    # Save checkpoint after training
     checkpoint.save(file_prefix=checkpoint_prefix)
     model.save_weights(os.path.join(config["train_dir"], "last_weights.weights.h5"))
